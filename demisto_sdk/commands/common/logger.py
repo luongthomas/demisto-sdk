@@ -1,6 +1,4 @@
 import logging
-import os
-from datetime import datetime
 
 
 DEBUG = False
@@ -9,12 +7,13 @@ DEBUG = False
 def logging_setup(verbosity=False, logpath=None, logger_name=None):
     logger = logging.getLogger(logger_name)
     logger.removeHandler(logger.handlers.pop())
-    log_level = logging.INFO
+    log_level = logging.WARNING
     fmt = '%(message)s'
 
     ch = logging.StreamHandler()
     if verbosity:
-        log_level = logging.DEBUG
+        log_level = logging.WARNING
+    ch.terminator = ""
     formatter = logging.Formatter(fmt)
     logger.setLevel(log_level)
 
@@ -22,15 +21,6 @@ def logging_setup(verbosity=False, logpath=None, logger_name=None):
     ch.setFormatter(formatter)
     logger.addHandler(ch)
     logger.propagate = False
-
-    if logpath:
-        file_handler = logging.FileHandler(
-            os.path.join(logpath, f"demisto-sdk-lint_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"))
-
-        file_handler.setLevel(logging.DEBUG)
-
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
 
     return logger
 

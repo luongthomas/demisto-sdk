@@ -10,7 +10,7 @@ import yaml
 import tempfile
 import mmap
 # 3-rd party packages
-from docker import DockerClient
+import docker
 from docker import errors as docker_errors
 from jinja2 import Environment, FileSystemLoader
 # Local packages
@@ -47,19 +47,15 @@ class Linter:
         self.docker_login_completed = False
         self.common_server_created = False
 
-    def run_dev_packages(self, docker_client: DockerClient, lint_status: Dict[str, Any], pbar, no_flake8: bool,
-                         no_bandit: bool,
-                         no_mypy: bool, no_pylint: bool, no_test: bool, keep_container: bool) \
-            -> Tuple[int, Dict[str, Any], Dict[str, Any]]:
+    def run_dev_packages(self, no_flake8: bool, no_bandit: bool, no_mypy: bool,
+                         no_pylint: bool, no_test: bool, keep_container: bool) \
+            -> Tuple[int, Dict[str, Any]]:
         """Run lint and tests on single package
         Perfroming the follow:
             1. Run the lint on OS - flake8, bandit, mypy.
             2. Run in package docker - pylint, pytest.
 
         Args:
-            docker_client: docker client for communication with docker daemon
-            lint_status: all packages lint and test status
-            pbar: progress bar object to be updated.
             no_flake8: Whether to skip flake8.
             no_bandit: Whether to skip bandit.
             no_mypy: Whether to skip mypy.
@@ -70,10 +66,13 @@ class Linter:
         Returns:
             (exit code 0 if all succeed else 1, lint and test all status, pkg status)
         """
+        print("started")
+        docker_client = docker.from_env()
         pkg_lint_status = {
             "pkg": self.pack_name,
             "path": self.pack_rel_dir,
             "images": [],
+            "python_version": None,
             "flake8_exit_code": 0,
             "flake8_errors": None,
             "bandit_exit_code": 0,
@@ -84,19 +83,19 @@ class Linter:
             "pylint_errors": None,
             "pytest_exit_code": 0,
             "pytest_errors": [],
-            "pytest_collected_tests": []
+            "pytest_collected_tests": [],
+            "status": True
         }
 
         return_exit_code = 0
 
         # Loading pkg yaml
-        pbar.set_description_str(f"{self.pack_name} - yaml")
         _, yml_path = get_yml_paths_in_dir(self.pack_abs_dir, "")
         if not yml_path:
             logger.debug(
                 f"{Colors.Fg.cyan}{self.pack_name}{Colors.reset} - Skiping no yaml file found{Colors.Fg.cyan}{yml_path}"
                 f"{Colors.reset}")
-            return 0, lint_status, pkg_lint_status
+            return 0, pkg_lint_status
         logger.debug(
             f"{Colors.Fg.cyan}{self.pack_name}{Colors.reset} - Using yaml file {Colors.Fg.cyan}{yml_path}"
             f"{Colors.reset}")
@@ -109,10 +108,10 @@ class Linter:
         if script_type != 'python':
             if script_type == 'powershell':
                 # TODO powershell linting
-                return 0, lint_status, pkg_lint_status
+                return 0, pkg_lint_status
             logger.debug(
                 f"{Colors.Fg.cyan}{self.pack_name}{Colors.reset} - Skipping due to undefined 'type' in yaml")
-            return 0, lint_status, pkg_lint_status
+            return 0, pkg_lint_status
         # Getting docker images from pkg yaml
         images = get_all_docker_images(script_obj)
         logger.debug(
@@ -120,11 +119,11 @@ class Linter:
             f"{Colors.reset}")
         # Getting python version form docker image
         py_num = get_python_version(images[0], False, True)
+        pkg_lint_status["python_version"] = py_num
         # Copy demisto-mock, CommonServerUserPython to pkg path
         self._setup_dev_files(py_num)
         # Perform lint check on OS
         for lint_check in ["flake8", "bandit", "mypy"]:
-            pbar.set_description_str(f"{self.pack_name} - {lint_check}")
             exit_code: int = 0
             output: str = ""
             if lint_check == "flake8":
@@ -139,9 +138,7 @@ class Linter:
             if exit_code:
                 pkg_lint_status[f"{lint_check}_exit_code"] = exit_code
                 pkg_lint_status[f"{lint_check}_errors"] = output
-                pkg_lint_status["status"] = 1
-                lint_status[f"{lint_check}_exit_code"] = 1
-                lint_status[f"{lint_check}_errors"][self.pack_name] = output
+                pkg_lint_status["status"] = False
                 return_exit_code = 1
 
         # Pylint and pytest excution in pkg docker images
@@ -152,8 +149,7 @@ class Linter:
                 for try_num in range(1):
                     # gettig py versions
                     py_num = get_python_version(image, False, True)
-                    pkg_lint_status["images"].append({"image": image,
-                                                      "python_version": py_num})
+                    pkg_lint_status["images"].append(image)
                     logger.debug(
                         f"{Colors.Fg.cyan}{self.pack_name}{Colors.reset} - Image {Colors.Fg.cyan}{image}{Colors.reset}"
                         f" - python{py_num}")
@@ -163,7 +159,6 @@ class Linter:
                     else:
                         requirements = self.req_3
                     # Creating image if pylint specifie or found tests and tests specified
-                    pbar.set_description_str(f"{self.pack_name} - create img")
                     docker_image_created = self._docker_image_create(docker_client, image, requirements)
                     # Run pylint and pytest insdie docker
                     need_to_retry = False
@@ -171,27 +166,23 @@ class Linter:
                         exit_code: int = 0
                         output: list = []
                         if not no_test and check == "pytest":
-                            pbar.set_description_str(f"{self.pack_name} - pytest")
                             exit_code, output, collected_tests = self._docker_run_pytest(docker_client,
                                                                                          docker_image_created,
                                                                                          keep_container)
                             pkg_lint_status["pytest_collected_tests"] = collected_tests
                         elif not no_pylint and check == "pylint":
-                            pbar.set_description_str(f"{self.pack_name} - pylint")
                             exit_code, output = self._docker_run_pylint(docker_client, docker_image_created,
                                                                         keep_container)
                         if exit_code:
                             pkg_lint_status[f"{check}_exit_code"] = exit_code
                             pkg_lint_status[f"{check}_errors"] = output
-                            pkg_lint_status["status"] = 1
-                            lint_status[f"{check}_errors"][self.pack_name] = output
-                            lint_status[f"{check}_exit_code"] = 1
+                            pkg_lint_status["status"] = False
                             return_exit_code = 1
                             need_to_retry = True
                     if not need_to_retry:
                         break
 
-        return return_exit_code, lint_status, pkg_lint_status
+        return return_exit_code, pkg_lint_status
 
     def get_common_server_python(self):
         """Getting common server python in not exists changes self.common_server_created to True if needed.
@@ -298,7 +289,7 @@ class Linter:
             logging.debug(f"{Colors.Fg.cyan}{self.pack_name}{Colors.reset} - bandit finished - Errors found")
             return 1, output
 
-    def _docker_image_create(self, docker_client: DockerClient, docker_base_image, requirements, ) -> str:
+    def _docker_image_create(self, docker_client: docker.DockerClient, docker_base_image, requirements, ) -> str:
         """Create the docker image:
             1. Installing build base if required in alpine images version - https://wiki.alpinelinux.org/wiki/GCC
             2. Installing pypi packs - if only pylint required - only pylint installed otherwise all pytest and pylint
@@ -332,28 +323,27 @@ class Linter:
                 fp.seek(0)
                 test_image = docker_client.images.build(path=self.pack_abs_dir,
                                                         dockerfile=os.path.basename(fp.name),
-                                                        tag=docker_base_image + "-test",
-                                                        forcerm=True)
-        except docker_errors.BuildError:
+                                                        tag=docker_base_image + "-test")
+        except docker_errors.BuildError as ex:
             logger.error(
-                f"{Colors.Fg.cyan}{self.pack_name}{Colors.reset} - Failed build test image absed on "
+                f"{Colors.Fg.cyan}{self.pack_name}{Colors.reset} - Failed build test image absed on: {ex}"
                 f"{docker_base_image}")
-        except docker_errors.APIError:
-            logger.debug(
-                f"{Colors.Fg.cyan}{self.pack_name}{Colors.reset} - Failed communicating with docker daemon.")
+        except docker_errors.APIError as ex:
+            logger.error(
+                f"{Colors.Fg.cyan}{self.pack_name}{Colors.reset} - Failed communicating with docker daemon: {ex}")
 
         logger.debug(
             f"{Colors.Fg.cyan}{self.pack_name}{Colors.reset} - Image {docker_base_image} created succefully")
         # Push image to repository if ENV supplied
-        if self._docker_login(docker_client):
-            logger.info(f"Pushing image: {test_image} to docker hub")
-            docker_client.push(test_image)
-            logger.debug(f"{Colors.Fg.cyan}{self.pack_name}{Colors.reset} - Done creating docker image:"
-                         f" {docker_base_image} ")
+        # if self._docker_login(docker_client):
+        #     logger.info(f"Pushing image: {test_image} to docker hub")
+        #     docker_client.push(test_image)
+        #     logger.debug(f"{Colors.Fg.cyan}{self.pack_name}{Colors.reset} - Done creating docker image:"
+        #                  f" {docker_base_image} ")
 
         return test_image[0].short_id
 
-    def _docker_login(self, docker_client: DockerClient) -> bool:
+    def _docker_login(self, docker_client: docker.DockerClient) -> bool:
         """Loging to docker client to dockerhub
         The credentials getting from shell env as vars:
             1. DOCKERHUB_USER - mandatory
@@ -391,7 +381,7 @@ class Linter:
         self.docker_login_completed = True
         return True
 
-    def _docker_run_pylint(self, docker_client: DockerClient, test_image: str, keep_container: bool) -> Tuple[
+    def _docker_run_pylint(self, docker_client: docker.DockerClient, test_image: str, keep_container: bool) -> Tuple[
             int, Optional[list]]:
         """Run Pylint in container based to created test image
 
@@ -431,10 +421,7 @@ class Linter:
                 # 2-Error message issued
                 logger.debug(
                     f"{Colors.Fg.cyan}{self.pack_name}{Colors.reset} - Running pylint finished - Errors found")
-                container_log: list = container_obj.logs().decode("utf-8").split("\n")
-                for i in range(len(container_log) - 1):
-                    if '********' in container_log[i] or not container_log[i]:
-                        container_log.pop(i)
+                container_log: list = container_obj.logs().decode("utf-8")
                 container_exit_code = 1
             elif container_exit_code in [4, 8, 16]:
                 # 4-Warning message issued
@@ -458,25 +445,27 @@ class Linter:
             else:
                 try:
                     container_obj.remove(force=True)
-                except docker_errors.NotFound:
-                    logger.debug(
-                        f"{Colors.Fg.cyan}{self.pack_name}{Colors.reset} - {self.pack_name}-pylint -  unable to remove "
+                except docker_errors.NotFound as ex:
+                    logger.error(
+                        f"{Colors.Fg.cyan}{self.pack_name}{Colors.reset} - {self.pack_name}-pylint -  unable to "
+                        f"remove: {ex}"
                         f"container after finish")
-        except docker_errors.ImageNotFound:
+        except docker_errors.ImageNotFound as ex:
             container_exit_code = 1
             container_log = f"Unable to find image {test_image}"
-            logger.debug(
-                f"{Colors.Fg.cyan}{self.pack_name}{Colors.reset} - Old {self.pack_name}-Image not found - container"
+            logger.error(
+                f"{Colors.Fg.cyan}{self.pack_name}{Colors.reset} - Old {self.pack_name}-Image not found - container: "
+                f"{ex}"
                 f" running error")
-        except docker_errors.APIError:
+        except docker_errors.APIError as ex:
             container_exit_code = 1
             container_log = f"Failed communicating with docker daemon"
-            logger.debug(
-                f"{Colors.Fg.cyan}{self.pack_name}{Colors.reset} - Failed communicating with docker daemon.")
+            logger.error(
+                f"{Colors.Fg.cyan}{self.pack_name}{Colors.reset} - Failed communicating with docker daemon: {ex}")
 
         return container_exit_code, container_log
 
-    def _docker_run_pytest(self, docker_client: DockerClient, test_image: str, keep_container: bool) -> Tuple[
+    def _docker_run_pytest(self, docker_client: docker.DockerClient, test_image: str, keep_container: bool) -> Tuple[
             int, Optional[list], str]:
         """Run Pylint in container based to created test image
 
@@ -531,6 +520,7 @@ class Linter:
                 container_obj = docker_client.containers.run(name=f"{self.pack_name}-pytest",
                                                              image=test_image,
                                                              command=[pytest_command],
+                                                             user=":40000",
                                                              detach=True)
                 # Waiting for container to be finished
                 container_status = container_obj.wait(condition="exited")

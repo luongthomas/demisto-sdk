@@ -1,14 +1,13 @@
 # STD python packages
-import concurrent
 import os
-import concurrent.futures.thread
+# import concurrent.futures.thread
 from typing import List, Dict, Any, Optional
 import logging
 import time
+import json
+from multiprocessing import Pool
 # 3-rd party packages
-import docker
 from jinja2 import Environment, FileSystemLoader
-from tqdm import tqdm
 # Local packages
 from demisto_sdk.commands.common.configuration import Configuration
 from demisto_sdk.commands.common.constants import PACKS_DIR, INTEGRATIONS_DIR, SCRIPTS_DIR, BETA_INTEGRATIONS_DIR
@@ -35,15 +34,19 @@ class LintManager:
         logger = logging_setup(verbosity=verbose)
         self.config = Configuration()
         self.pkgs: List[str]
+        self.total_found: int = 0
         if all_packs or (not dir_packs and git):
             self.pkgs = LintManager.get_all_directories()
-            logger.info(f"Packages found {Colors.Fg.cyan}{len(self.pkgs)}{Colors.reset}")
         else:
             self.pkgs = dir_packs.split(',')
+        self.total_found = len(self.pkgs)
+        logger.warning(f"Packages found {Colors.Fg.cyan}{self.total_found}{Colors.reset}\n")
         if git:
-            self.pkgs = LintManager._get_packages_to_run(self.pkgs)
+            self.pkgs = self._get_packages_to_run(pkgs=self.pkgs)
             for pkg in self.pkgs:
-                logger.info(f"Pkgs added after comparing to git {Colors.Fg.cyan}{pkg}{Colors.reset}")
+                logger.warning(f"Pkgs added after comparing to git {Colors.Fg.cyan}{pkg}{Colors.reset}\n")
+        logger.warning(f"Execute lint and test on {Colors.Fg.cyan}{len(self.pkgs)}/{self.total_found}{Colors.reset} "
+                       f"packages\n")
         self.requirements_for_python3: str = get_dev_requirements(3.7, self.config.envs_dirs_base)
         self.requirements_for_python2: str = get_dev_requirements(2.7, self.config.envs_dirs_base)
         self.common_server_created: bool = False
@@ -64,68 +67,93 @@ class LintManager:
             int. 0 on success and 1 if any package failed
         """
         # Overall tests status
-        lint_status: Dict[str, Any] = {
-            "status": 0,
-            "flake8_exit_code": 0,
-            "flake8_errors": {},
-            "bandit_exit_code": 0,
-            "bandit_errors": {},
-            "mypy_exit_code": 0,
-            "mypy_errors": {},
-            "pylint_exit_code": 0,
-            "pylint_errors": {},
-            "pytest_exit_code": 0,
-            "pytest_errors": {},
-            "pytest_collected_tests": []
-        }
+        pass_packs = []
+        fail_packs = []
+
         # Detailed packages status
         pkgs_status: List[Dict[str, Any]] = []
         # Cumulative exit to be returned
         return_exit_code: int = 0
-        # Get docker client for dockr setup
-        docker_client = docker.from_env()
+        # Counter for finished tasks
+        counter = 0
 
-        linters: List[Linter] = []
-        for pack in self.pkgs:
-            logger.debug(f"Permform lint on {Colors.Fg.cyan}{pack}{Colors.reset}")
-            linter: Linter = Linter(pack_dir=pack,
-                                    req_2=self.requirements_for_python2,
-                                    req_3=self.requirements_for_python3)
-            linters.append(linter)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
-            future_to_linter = {}
-            pbar = tqdm(unit="pkgs", bar_format='{percentage:3.0f}%:{bar}{r_bar} {desc}', ncols=100,
-                        total=len(self.pkgs))
-            # Start the load operations
+        with Pool(processes=parallel) as pool:
+            linters: List[Linter] = []
+            for pack in self.pkgs:
+                logger.debug(f"Permform lint on {Colors.Fg.cyan}{pack}{Colors.reset}")
+                linter: Linter = Linter(pack_dir=pack,
+                                        req_2=self.requirements_for_python2,
+                                        req_3=self.requirements_for_python3)
+                linters.append(linter)
+            logger.warning("Executing lint and tests validation... (If this the first time could take up to 1 min)\n")
+            results = []
             for linter in linters:
-                future_to_linter[executor.submit(fn=linter.run_dev_packages,
-                                                 docker_client=docker_client,
-                                                 lint_status=lint_status,
-                                                 pbar=pbar,
-                                                 no_flake8=no_flake8,
-                                                 no_bandit=no_bandit,
-                                                 no_mypy=no_mypy,
-                                                 no_pylint=no_pylint,
-                                                 no_test=no_test,
-                                                 keep_container=keep_container)] = linter
-            for future in concurrent.futures.as_completed(future_to_linter):
-                pbar.update()
-                pbar.set_description_str(f"{future_to_linter[future].pack_name}")
-                exit_code, lint_status, pkg_status = future.result()
+                results.append(pool.apply_async(func=linter.run_dev_packages,
+                                                kwds={"no_flake8": no_flake8,
+                                                      "no_bandit": no_bandit,
+                                                      "no_mypy": no_mypy,
+                                                      "no_pylint": no_pylint,
+                                                      "no_test": no_test,
+                                                      "keep_container": keep_container
+                                                      }))
+
+            for result in results:
+                exit_code, pkg_status = result.get()
                 pkgs_status.append(pkg_status)
                 if exit_code:
                     return_exit_code = exit_code
-            pbar.set_description_str(f"Finished")
-            pbar.close()
+                    fail_packs.append(pkg_status["pkg"])
+                else:
+                    pass_packs.append(pkg_status["pkg"])
+                counter += 1
+                if exit_code:
+                    self._print_final_results(pkg_status)
+                else:
+                    logger.warning(f"{Colors.Fg.green}P{Colors.reset}")
 
-        # Iterating overall packages required - performing all chosen tests
+        # with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
+        #     future_to_linter = {}
+        #     # Start the load operations
+        #     for linter in linters:
+        #         future_to_linter[executor.submit(fn=linter.run_dev_packages,
+        #                                          docker_client=docker_client,
+        #                                          no_flake8=no_flake8,
+        #                                          no_bandit=no_bandit,
+        #                                          no_mypy=no_mypy,
+        #                                          no_pylint=no_pylint,
+        #                                          no_test=no_test,
+        #                                          keep_container=keep_container)] = linter
+        #     for future in concurrent.futures.as_completed(future_to_linter):
+        #         exit_code, pkg_status = future.result()
 
-        self._print_final_results(lint_status)
+        logger.warning(f"\n\n{Colors.Fg.cyan}TEST RESULTS:{Colors.reset}\n")
+        logger.warning(f"Total packages: {self.total_found}\n")
+        logger.warning(f"{Colors.Fg.green}Pass packages: {len(pass_packs)}{Colors.reset}\n")
+        logger.warning(f"{Colors.Fg.red}Fail packages: {len(fail_packs)}{Colors.reset}")
+        for fail in fail_packs:
+            logger.warning(f"\n{Colors.Fg.red}  - {fail}{Colors.reset}")
+
         if report:
             self._generate_report(pkgs_status, report)
 
         return return_exit_code
+
+    @staticmethod
+    def _get_packages_to_run(pkgs: list) -> list:
+        """Checks which packages had changes in them and should run on Lint.
+
+        Returns:
+            list[str]. A list of names of packages that should run.
+        """
+        # get the current branch name.
+        current_branch = run_command(f"git rev-parse --abbrev-ref HEAD")
+        logger.warning(f"Checking for pkgs changed in branch {Colors.Fg.cyan}{current_branch[:-1]}{Colors.reset}\n")
+        pkgs_to_run = []
+        for directory in pkgs:
+            if LintManager._check_should_run_pkg(pkg_dir=directory):
+                pkgs_to_run.append(directory)
+
+        return pkgs_to_run
 
     @staticmethod
     def get_all_directories() -> List[str]:
@@ -157,25 +185,6 @@ class LintManager:
         return all_directories
 
     @staticmethod
-    def _get_packages_to_run(pkgs: List[str]) -> List[str]:
-        """Checks which packages had changes in them and should run on Lint.
-
-        Returns:
-            list[str]. A list of names of packages that should run.
-        """
-        # get the current branch name.
-        current_branch = run_command(f"git rev-parse --abbrev-ref HEAD")
-        logger.info(f"Checking for pkgs changed in branch {Colors.Fg.cyan}{current_branch[:-1]}{Colors.reset}")
-        pkgs_to_run = []
-        pbar = tqdm(iterable=pkgs, unit="pkgs", bar_format='{percentage:3.0f}%:{bar}{r_bar}', ncols=100)
-        for directory in pbar:
-            if LintManager._check_should_run_pkg(pkg_dir=directory):
-                pkgs_to_run.append(directory)
-        pbar.close()
-
-        return pkgs_to_run
-
-    @staticmethod
     def _check_should_run_pkg(pkg_dir: str) -> bool:
         """Checks if there is a difference in the package before this Lint run and after it.
 
@@ -204,7 +213,7 @@ class LintManager:
         return False
 
     @staticmethod
-    def _print_final_results(lint_status) -> int:
+    def _print_final_results(pkg_status) -> int:
         """Print the results of parallel lint command.
 
         Args:
@@ -213,29 +222,15 @@ class LintManager:
         Returns:
             int. 0 on success and 1 if any package failed
      """
-        logger.info("\n")
         # Log summary status
+        logger.warning(f"\n{Colors.Fg.cyan}{pkg_status['pkg']}{Colors.reset}\n")
         for check in ["flake8", "bandit", "mypy", "pylint", "pytest"]:
-            if lint_status[f"{check}_exit_code"]:
-                logger.warning(f"{check} - {Colors.Bg.red}[FAILED]{Colors.reset}")
+            spacing = 7 - len(check)
+            if pkg_status[f"{check}_exit_code"]:
+                logger.warning(f"{check}{' ' * spacing} {Colors.Bg.red}[FAILED]{Colors.reset}\n")
+                logger.warning(f"{pkg_status[f'{check}_errors']}\n")
             else:
-                logger.warning(f"{check} - {Colors.Bg.green}[PASS]{Colors.reset}")
-        logger.info("\n")
-        # Log errors from string
-        for check in ["flake8", "bandit", "mypy"]:
-            if lint_status[f"{check}_exit_code"]:
-                logger.info(f"{Colors.underline}{Colors.bold}{check} - Errors summary{Colors.reset}")
-                for pkg, error in lint_status[f"{check}_errors"].items():
-                    logger.info(f"{Colors.Fg.cyan}Package - {pkg}{Colors.reset}")
-                    logger.info(f"{error}")
-        # Log errors from list
-        for check in ["pylint", "pytest"]:
-            if lint_status[f"{check}_exit_code"]:
-                logger.info(f"{Colors.underline}{Colors.bold}{check} - Errors summary{Colors.reset}")
-                for pkg, errors in lint_status[f"{check}_errors"].items():
-                    logger.info(f"{Colors.Fg.cyan}Package - {pkg}{Colors.reset}")
-                    for error in errors:
-                        logger.info(f"{error}")
+                logger.warning(f"{check}{' ' * spacing} {Colors.Bg.green}[PASS]{Colors.reset}\n")
 
     def _generate_report(self, pkgs_status: Dict[str, Any], report: Optional[str]) -> int:
         """Print the results of parallel lint command.
@@ -248,7 +243,7 @@ class LintManager:
         """
         file_loader = FileSystemLoader(f'{self.config.sdk_env_dir}/lint/templates')
         env = Environment(loader=file_loader)
-        template = env.get_template('report.jinja2')
-        table = template.render(pkgs_status=pkgs_status)
+        template = env.get_template('report.html')
+        table = template.render(pkgs_status=json.dumps(pkgs_status))
         with open(f"{report}/index{time.strftime('%Y%m%d-%H%M%S')}.html", mode='w') as f:
             f.write(table)
